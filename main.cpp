@@ -118,11 +118,7 @@ auto put_directory(const bfs::path& _from, const ifs::path& _to) -> void
             const auto dir = std::prev(std::end(e.path()))->string();
             const auto to = _to / dir;
 
-            {
-                auto comm = connect_to_irods();
-                ifs::create_collections(*comm, to);
-            }
-
+            ifs::create_collections(*connect_to_irods(), to);
             put_directory(e.path(), to);
         }
     }
