@@ -8,8 +8,11 @@
 #include <array>
 #include <stdexcept>
 #include <iterator>
+#include <thread>
 
 #include <boost/filesystem.hpp>
+#include <boost/asio.hpp>
+#include <boost/asio/thread_pool.hpp>
 
 namespace bfs = boost::filesystem;
 namespace ifs = irods::experimental::filesystem;
@@ -18,20 +21,22 @@ using comm_ptr = std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>;
 
 auto connect_to_irods() -> comm_ptr;
 auto put_file(const bfs::path& _from, const ifs::path& _to) -> void;
-auto put_directory(const bfs::path& _from, const ifs::path& _to) -> void;
+auto put_directory(boost::asio::thread_pool& _pool, const bfs::path& _from, const ifs::path& _to) -> void;
 
 int main(int _argc, char* _argv[])
 {
-    if (_argc != 2)
+    if (_argc != 3)
     {
-        std::cerr << "did you forget to pass something?\n";
+        std::cerr << "USAGE:\n"
+                  << "\tmy_iput <file> <iRODS collection>\n"
+                  << "\tmy_iput <directory> <iRODS collection>\n";
         return 0;
     }
 
     try
     {
         const auto p = bfs::canonical(_argv[1]);
-        const ifs::path home = "/tempZone/home/rods";
+        const ifs::path home = _argv[2];
 
         if (bfs::is_regular_file(p))
         {
@@ -39,17 +44,23 @@ int main(int _argc, char* _argv[])
         }
         else if (bfs::is_directory(p))
         {
+            //std::cout << "hardware concurrency = " << std::thread::hardware_concurrency() << '\n';
+            //boost::asio::thread_pool pool{std::thread::hardware_concurrency()};
+            boost::asio::thread_pool pool;
             const auto collection_name = *std::prev(std::end(p));
-            put_directory(p, home / collection_name.string());
+            put_directory(pool, p, home / collection_name.string());
+            pool.join();
         }
         else
         {
             std::cerr << "path must point to a file or directory\n";
+            return 1;
         }
     }
     catch (const std::exception& e)
     {
         std::cerr << e.what() << '\n';
+        return 1;
     }
 
     return 0;
@@ -97,29 +108,25 @@ auto put_file(const bfs::path& _from, const ifs::path& _to) -> void
     }
 }
 
-auto put_directory(const bfs::path& _from, const ifs::path& _to) -> void
+auto put_directory(boost::asio::thread_pool& _pool, const bfs::path& _from, const ifs::path& _to) -> void
 {
     for (auto&& e : bfs::directory_iterator{_from})
     {
         if (bfs::is_regular_file(e.status()))
         {
-            //std::cout << e.path() << " -> " << (_to / e.path().filename().string()) << '\n';
-            put_file(e.path(), _to / e.path().filename().string());
+            boost::asio::post(_pool, [p = e.path(), _to]() {
+                put_file(p, _to / p.filename().string());
+            });
         }
         else if (bfs::is_directory(e.status()))
         {
-            /*
-            const auto dir = std::prev(std::end(e.path()))->string();
-            const auto to = _to / dir;
-            std::cout << "created " << to << '\n';
-            put_directory(e.path(), to);
-            */
+            boost::asio::post(_pool, [&_pool, p = e.path(), _to]() {
+                const auto dir = std::prev(std::end(p))->string();
+                const auto to = _to / dir;
 
-            const auto dir = std::prev(std::end(e.path()))->string();
-            const auto to = _to / dir;
-
-            ifs::create_collections(*connect_to_irods(), to);
-            put_directory(e.path(), to);
+                ifs::create_collections(*connect_to_irods(), to);
+                put_directory(_pool, p, to);
+            });
         }
     }
 }
