@@ -12,6 +12,7 @@
 #include <iterator>
 #include <thread>
 #include <mutex>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 #include <boost/asio.hpp>
@@ -25,8 +26,10 @@ using comm_ptr = std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>;
 auto init_irods_environment() -> void;
 auto connect_to_irods() -> comm_ptr;
 auto put_file(const fs::path& _from, const ifs::path& _to) -> void;
+auto put_file(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
+auto put_directory_no_recursive(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
 
 rodsEnv env;
 
@@ -58,7 +61,8 @@ int main(int _argc, char* _argv[])
         else if (fs::is_directory(p))
         {
             boost::asio::thread_pool pool{std::thread::hardware_concurrency()};
-            put_directory(pool, p, home / std::rbegin(p)->string());
+            //put_directory(pool, p, home / std::rbegin(p)->string());
+            put_directory_no_recursive(pool, p, home / std::rbegin(p)->string());
             pool.join();
         }
         else
@@ -135,6 +139,82 @@ auto put_file(const fs::path& _from, const ifs::path& _to) -> void
     catch (const std::exception& e)
     {
         std::cerr << e.what() << '\n';
+    }
+}
+
+auto put_file(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void
+{
+    constexpr auto thread_count = 4;
+    const auto size = fs::file_size(_from);
+    const auto chunk_size = size / thread_count;
+    const auto remaining_bytes = size % thread_count;
+
+    for (int i = 0; i < thread_count; ++i)
+    {
+        boost::asio::post(_pool, [=, &_pool]() {
+            (void) _pool;
+
+            try
+            {
+                std::ifstream in{_from.c_str(), std::ios_base::binary};
+
+                if (!in)
+                    throw std::runtime_error{"cannot open file for reading"};
+
+                auto comm = connect_to_irods();
+
+                if (!comm)
+                    throw std::runtime_error{"cannot open connection to iRODS server"};
+
+                irods::experimental::odstream out{*comm, _to};
+
+                if (!out)
+                    throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+
+                std::vector<char> buf(chunk_size);
+
+                in.seekg(i * chunk_size).read(buf.data(), buf.size());
+                out.seekp(i * chunk_size).write(buf.data(), in.gcount());
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+        });
+    }
+
+    if (remaining_bytes > 0)
+    {
+        boost::asio::post(_pool, [=, &_pool]() {
+            (void) _pool;
+
+            try
+            {
+                std::ifstream in{_from.c_str(), std::ios_base::binary};
+
+                if (!in)
+                    throw std::runtime_error{"cannot open file for reading"};
+
+                auto comm = connect_to_irods();
+
+                if (!comm)
+                    throw std::runtime_error{"cannot open connection to iRODS server"};
+
+                irods::experimental::odstream out{*comm, _to};
+
+                if (!out)
+                    throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+
+                std::vector<char> buf(remaining_bytes);
+
+                in.seekg(thread_count * chunk_size).read(buf.data(), buf.size());
+                out.seekp(thread_count * chunk_size).write(buf.data(), in.gcount());
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << e.what() << '\n';
+            }
+        });
     }
 }
 
@@ -233,5 +313,37 @@ auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const
         });
     }
     */
+}
+
+auto put_directory_no_recursive(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void
+{
+    fs::path prefix = _to.c_str();
+
+    for (auto&& e : fs::recursive_directory_iterator{_from})
+    {
+        if (fs::is_regular_file(e.status()))
+        {
+            if (*std::rbegin(e.path().parent_path()) != *std::rbegin(prefix))
+                prefix = prefix.parent_path();
+
+            //std::cout << e.path() << " -> " << (prefix / e.path().filename().c_str()) << '\n';
+
+            boost::asio::post(_pool, [&_pool, from = e.path(), to = prefix / e.path().filename().c_str()]() {
+                ifs::create_collections(*connect_to_irods(), to.parent_path().string());
+                put_file(_pool, from, to.c_str());
+            });
+        }
+        else if (fs::is_directory(e.status()))
+        {
+            if (*std::rbegin(e.path().parent_path()) == *std::rbegin(prefix))
+                prefix /= *std::rbegin(e.path());
+
+            //std::cout << e.path() << " -> " << prefix << '\n';
+
+            boost::asio::post(_pool, [to = prefix.string()]() {
+                ifs::create_collections(*connect_to_irods(), to);
+            });
+        }
+    }
 }
 
