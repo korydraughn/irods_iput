@@ -131,7 +131,7 @@ private:
     std::ofstream out_;
 };
 
-//std::unique_ptr<connection_pool> conn_pool;
+//std::unique_ptr<connection_pool> conn_pool; // Causes segfault for some reason!!!
 connection_pool* conn_pool;
 
 int main(int _argc, char* _argv[])
@@ -147,7 +147,7 @@ int main(int _argc, char* _argv[])
     try
     {
         const auto from = fs::canonical(_argv[1]);
-        const ifs::path home = _argv[2];
+        const ifs::path to = _argv[2];
 
         auto api_table = irods::get_client_api_table();
         auto pck_table = irods::get_pack_table();
@@ -158,12 +158,12 @@ int main(int _argc, char* _argv[])
 
         if (fs::is_regular_file(from))
         {
-            put_file(conn_pool->get_connection(), from, home / from.filename().string());
+            put_file(conn_pool->get_connection(), from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
         {
             boost::asio::thread_pool pool{std::thread::hardware_concurrency()};
-            put_directory(pool, from, home / std::rbegin(from)->string());
+            put_directory(pool, from, to / std::rbegin(from)->string());
             pool.join();
         }
         else
@@ -216,21 +216,18 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
 
 auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void
 {
+    ifs::create_collections(conn_pool->get_connection(), _to);
+
     for (auto&& e : fs::directory_iterator{_from})
     {
         boost::asio::post(_pool, [&_pool, s = e.status(), from = e.path(), _to]() {
             if (fs::is_regular_file(s))
             {
-                auto conn = conn_pool->get_connection();
-                //ifs::create_collections(conn, _to);
-                put_file(conn, from, _to / from.filename().string());
+                put_file(conn_pool->get_connection(), from, _to / from.filename().string());
             }
             else if (fs::is_directory(s))
             {
-                const auto to = _to / std::rbegin(from)->string();
-                auto conn = conn_pool->get_connection();
-                ifs::create_collections(conn, to);
-                put_directory(_pool, from, to);
+                put_directory(_pool, from, _to / std::rbegin(from)->string());
             }
         });
     }
