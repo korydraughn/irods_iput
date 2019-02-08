@@ -19,24 +19,17 @@
 #include <boost/asio.hpp>
 #include <boost/asio/thread_pool.hpp>
 
-namespace fs  = boost::filesystem;
-namespace ifs = irods::experimental::filesystem;
+namespace fs   = boost::filesystem;
+namespace ifs  = irods::experimental::filesystem;
+namespace asio = boost::asio;
 
-using comm_ptr = std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>;
-
-constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
-
-auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
-auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
-
-template <std::size_t Connections = 4>
 class connection_pool
 {
 private:
-    struct conn_context;
+    struct connection_context;
 
-    using conn_ptr  = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
-    using pool_type = std::array<conn_context, Connections>;
+    using connection_pointer      = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
+    using connection_context_list = std::vector<connection_context>;
 
 public:
     class connection_proxy
@@ -67,14 +60,14 @@ public:
         int index_;
     };
 
-    connection_pool()
+    explicit connection_pool(int _size = 4)
         : env_{}
-        , pool_{}
+        , conn_ctxs_(_size)
     {
         if (getRodsEnv(&env_) < 0)
             throw std::runtime_error{"cannot get iRODS env"};
 
-        for (auto&& ctx : pool_)
+        for (auto&& ctx : conn_ctxs_)
         {
             rErrMsg_t errors;
             ctx.conn.reset(rcConnect(env_.rodsHost, env_.rodsPort, env_.rodsUserName,
@@ -90,9 +83,9 @@ public:
 
     connection_proxy get_connection()
     {
-        for (int i = 0;; i = ++i % pool_.size())
+        for (int i = 0;; i = ++i % conn_ctxs_.size())
         {
-            std::unique_lock lock{pool_[i].mutex, std::defer_lock};
+            std::unique_lock lock{conn_ctxs_[i].mutex, std::defer_lock};
 
             if (lock.try_lock())
             {
@@ -100,34 +93,41 @@ public:
                     [&lock] { lock.unlock(); }
                 };
 
-                if (!pool_[i].in_use.load())
+                if (!conn_ctxs_[i].in_use.load())
                 {
-                    pool_[i].in_use.store(true);
+                    conn_ctxs_[i].in_use.store(true);
 
-                    return {*this, *pool_[i].conn, i};
+                    return {*this, *conn_ctxs_[i].conn, i};
                 }
             }
         }
     }
 
 private:
-    struct conn_context
+    struct connection_context
     {
         std::mutex mutex;
         std::atomic<bool> in_use{};
-        conn_ptr conn{nullptr, rcDisconnect};
+        connection_pointer conn{nullptr, rcDisconnect};
     };
 
     void return_connection(int _index) noexcept
     {
-        pool_[_index].in_use.store(false);
+        conn_ctxs_[_index].in_use.store(false);
     }
 
     rodsEnv env_;
-    pool_type pool_;
+    connection_context_list conn_ctxs_;
 };
 
-auto conn_pool = std::make_unique<connection_pool<4>>();
+constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
+
+auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
+
+auto put_directory(connection_pool& _conn_pool,
+                   asio::thread_pool& _pool,
+                   const fs::path& _from,
+                   const ifs::path& _to) -> void;
 
 int main(int _argc, char* _argv[])
 {
@@ -148,15 +148,17 @@ int main(int _argc, char* _argv[])
         auto pck_table = irods::get_pack_table();
         init_api_table(api_table, pck_table);
 
+        connection_pool conn_pool{4};
+
         if (fs::is_regular_file(from))
         {
-            put_file(conn_pool->get_connection(), from, to / from.filename().string());
+            put_file(conn_pool.get_connection(), from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
         {
-            boost::asio::thread_pool pool{std::thread::hardware_concurrency()};
-            put_directory(pool, from, to / std::rbegin(from)->string());
-            pool.join();
+            asio::thread_pool thread_pool{std::thread::hardware_concurrency()};
+            put_directory(conn_pool, thread_pool, from, to / std::rbegin(from)->string());
+            thread_pool.join();
         }
         else
         {
@@ -193,7 +195,7 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
             throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
 
         std::array<char, 4_MB> buf{};
-        //std::vector<char> buf(fs::file_size(_from));
+        //std::vector<char> buf(fs::file_size(_from)); // Not sure why this doesn't work.
 
         while (in)
         {
@@ -207,20 +209,25 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
     }
 }
 
-auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void
+auto put_directory(connection_pool& _conn_pool,
+                   asio::thread_pool& _thread_pool,
+                   const fs::path& _from,
+                   const ifs::path& _to) -> void
 {
-    ifs::create_collections(conn_pool->get_connection(), _to);
+    ifs::create_collections(_conn_pool.get_connection(), _to);
 
     for (auto&& e : fs::directory_iterator{_from})
     {
-        boost::asio::post(_pool, [&_pool, s = e.status(), from = e.path(), _to]() {
-            if (fs::is_regular_file(s))
+        asio::post(_thread_pool, [&_conn_pool, &_thread_pool, e, _to]() {
+            const auto& from = e.path();
+
+            if (fs::is_regular_file(e.status()))
             {
-                put_file(conn_pool->get_connection(), from, _to / from.filename().string());
+                put_file(_conn_pool.get_connection(), from, _to / from.filename().string());
             }
-            else if (fs::is_directory(s))
+            else if (fs::is_directory(e.status()))
             {
-                put_directory(_pool, from, _to / std::rbegin(from)->string());
+                put_directory(_conn_pool, _thread_pool, from, _to / std::rbegin(from)->string());
             }
         });
     }

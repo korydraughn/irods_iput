@@ -1,6 +1,6 @@
 #! /bin/bash
 
-clang++ -std=c++17 -stdlib=libc++ -nostdinc++ -Wall -Wextra -g \
+clang++ -std=c++17 -stdlib=libc++ -nostdinc++ -Wall -Wextra -O3 \
         -I/usr/include/irods \
         -I/opt/irods-externals/clang6.0-0/include/c++/v1 \
         -I/opt/irods-externals/boost1.67.0-0/include \
