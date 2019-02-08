@@ -3,6 +3,7 @@
 #include <irods/dstream.hpp>
 #include <irods/irods_client_api_table.hpp>
 #include <irods/irods_pack_table.hpp>
+#include <irods/irods_at_scope_exit.hpp>
 
 #include <iostream>
 #include <memory>
@@ -28,24 +29,20 @@ constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
 
+template <std::size_t Connections = 4>
 class connection_pool
 {
 private:
     struct conn_context;
 
-    using conn_ptr = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
-    using pool_type = std::array<conn_context, 4>;
+    using conn_ptr  = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
+    using pool_type = std::array<conn_context, Connections>;
 
 public:
     class connection_proxy
     {
     public:
-        connection_proxy(connection_pool& _pool, rcComm_t& _conn, int _index)
-            : pool_{_pool}
-            , conn_{_conn}
-            , index_{_index}
-        {
-        }
+        friend class connection_pool;
 
         ~connection_proxy()
         {
@@ -58,6 +55,13 @@ public:
         }
 
     private:
+        connection_proxy(connection_pool& _pool, rcComm_t& _conn, int _index) noexcept
+            : pool_{_pool}
+            , conn_{_conn}
+            , index_{_index}
+        {
+        }
+
         connection_pool& pool_;
         rcComm_t& conn_;
         int index_;
@@ -88,19 +92,20 @@ public:
     {
         for (int i = 0;; i = ++i % pool_.size())
         {
-            std::unique_lock l{pool_[i].mutex, std::defer_lock};
+            std::unique_lock lock{pool_[i].mutex, std::defer_lock};
 
-            if (l.try_lock())
+            if (lock.try_lock())
             {
+                irods::at_scope_exit<std::function<void()>> at_scope_exit{
+                    [&lock] { lock.unlock(); }
+                };
+
                 if (!pool_[i].in_use.load())
                 {
                     pool_[i].in_use.store(true);
-                    l.unlock();
 
                     return {*this, *pool_[i].conn, i};
                 }
-
-                l.unlock();
             }
         }
     }
@@ -113,7 +118,7 @@ private:
         conn_ptr conn{nullptr, rcDisconnect};
     };
 
-    void return_connection(int _index)
+    void return_connection(int _index) noexcept
     {
         pool_[_index].in_use.store(false);
     }
@@ -122,7 +127,7 @@ private:
     pool_type pool_;
 };
 
-auto conn_pool = std::make_unique<connection_pool>();
+auto conn_pool = std::make_unique<connection_pool<4>>();
 
 int main(int _argc, char* _argv[])
 {
