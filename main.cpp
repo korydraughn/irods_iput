@@ -5,20 +5,20 @@
 #include <irods/irods_pack_table.hpp>
 
 #include <iostream>
-#include <fstream>
 #include <memory>
-#include <fstream>
 #include <array>
+#include <vector>
 #include <stdexcept>
 #include <iterator>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 #include <boost/filesystem.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/thread_pool.hpp>
 
-namespace fs = boost::filesystem;
+namespace fs  = boost::filesystem;
 namespace ifs = irods::experimental::filesystem;
 
 using comm_ptr = std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>;
@@ -34,7 +34,7 @@ private:
     struct conn_context;
 
     using conn_ptr = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
-    using pool_type = std::array<conn_context, 20>;
+    using pool_type = std::array<conn_context, 4>;
 
 public:
     class connection_proxy
@@ -66,9 +66,6 @@ public:
     connection_pool()
         : env_{}
         , pool_{}
-        , mtx_{}
-        , next_{}
-        , out_{"./simple_iput_test.log"}
     {
         if (getRodsEnv(&env_) < 0)
             throw std::runtime_error{"cannot get iRODS env"};
@@ -87,52 +84,45 @@ public:
         }
     }
 
-    void print_status()
-    {
-        std::lock_guard l{mtx_};
-        for (pool_type::size_type i = 0; i < pool_.size(); ++i)
-            out_ << "in_use[" << i << "]: " << pool_[i].in_use << '\n';
-        out_ << std::endl;
-    }
-
     connection_proxy get_connection()
     {
-        //print_status();
-
+        for (int i = 0;; i = ++i % pool_.size())
         {
-            std::lock_guard l{mtx_};
+            std::unique_lock l{pool_[i].mutex, std::defer_lock};
 
-            while (pool_[next_].in_use)
-                next_ = ++next_ % pool_.size();
+            if (l.try_lock())
+            {
+                if (!pool_[i].in_use.load())
+                {
+                    pool_[i].in_use.store(true);
+                    l.unlock();
 
-            pool_[next_].in_use = true;
+                    return {*this, *pool_[i].conn, i};
+                }
+
+                l.unlock();
+            }
         }
-
-        return {*this, *pool_[next_].conn, next_};
     }
 
 private:
     struct conn_context
     {
-        bool in_use;
+        std::mutex mutex;
+        std::atomic<bool> in_use{};
         conn_ptr conn{nullptr, rcDisconnect};
     };
 
     void return_connection(int _index)
     {
-        std::lock_guard l{mtx_};
-        pool_[_index].in_use = false;
+        pool_[_index].in_use.store(false);
     }
 
     rodsEnv env_;
     pool_type pool_;
-    std::mutex mtx_;
-    int next_;
-    std::ofstream out_;
 };
 
-//std::unique_ptr<connection_pool> conn_pool; // Causes segfault for some reason!!!
-connection_pool* conn_pool;
+auto conn_pool = std::make_unique<connection_pool>();
 
 int main(int _argc, char* _argv[])
 {
@@ -152,9 +142,6 @@ int main(int _argc, char* _argv[])
         auto api_table = irods::get_client_api_table();
         auto pck_table = irods::get_pack_table();
         init_api_table(api_table, pck_table);
-
-        auto cpool = std::make_unique<connection_pool>();
-        conn_pool = cpool.get();
 
         if (fs::is_regular_file(from))
         {
@@ -201,6 +188,7 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
             throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
 
         std::array<char, 4_MB> buf{};
+        //std::vector<char> buf(fs::file_size(_from));
 
         while (in)
         {
