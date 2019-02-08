@@ -5,6 +5,7 @@
 #include <irods/irods_pack_table.hpp>
 
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <fstream>
 #include <array>
@@ -22,13 +23,116 @@ namespace ifs = irods::experimental::filesystem;
 
 using comm_ptr = std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>;
 
-auto init_irods_environment() -> void;
-auto connect_to_irods() -> comm_ptr;
-auto put_file(const fs::path& _from, const ifs::path& _to) -> void;
+constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
+
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void;
 
-rodsEnv env;
+class connection_pool
+{
+private:
+    struct conn_context;
+
+    using conn_ptr = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
+    using pool_type = std::array<conn_context, 20>;
+
+public:
+    class connection_proxy
+    {
+    public:
+        connection_proxy(connection_pool& _pool, rcComm_t& _conn, int _index)
+            : pool_{_pool}
+            , conn_{_conn}
+            , index_{_index}
+        {
+        }
+
+        ~connection_proxy()
+        {
+            pool_.return_connection(index_);
+        }
+
+        operator rcComm_t&() const noexcept
+        {
+            return conn_;
+        }
+
+    private:
+        connection_pool& pool_;
+        rcComm_t& conn_;
+        int index_;
+    };
+
+    connection_pool()
+        : env_{}
+        , pool_{}
+        , mtx_{}
+        , next_{}
+        , out_{"./simple_iput_test.log"}
+    {
+        if (getRodsEnv(&env_) < 0)
+            throw std::runtime_error{"cannot get iRODS env"};
+
+        for (auto&& ctx : pool_)
+        {
+            rErrMsg_t errors;
+            ctx.conn.reset(rcConnect(env_.rodsHost, env_.rodsPort, env_.rodsUserName,
+                                     env_.rodsZone, 0, &errors));
+            if (!ctx.conn)
+                throw std::runtime_error{"connect error"};
+
+            char password[] = "rods";
+            if (clientLoginWithPassword(ctx.conn.get(), password) != 0)
+                throw std::runtime_error{"client login error"};
+        }
+    }
+
+    void print_status()
+    {
+        std::lock_guard l{mtx_};
+        for (pool_type::size_type i = 0; i < pool_.size(); ++i)
+            out_ << "in_use[" << i << "]: " << pool_[i].in_use << '\n';
+        out_ << std::endl;
+    }
+
+    connection_proxy get_connection()
+    {
+        //print_status();
+
+        {
+            std::lock_guard l{mtx_};
+
+            while (pool_[next_].in_use)
+                next_ = ++next_ % pool_.size();
+
+            pool_[next_].in_use = true;
+        }
+
+        return {*this, *pool_[next_].conn, next_};
+    }
+
+private:
+    struct conn_context
+    {
+        bool in_use;
+        conn_ptr conn{nullptr, rcDisconnect};
+    };
+
+    void return_connection(int _index)
+    {
+        std::lock_guard l{mtx_};
+        pool_[_index].in_use = false;
+    }
+
+    rodsEnv env_;
+    pool_type pool_;
+    std::mutex mtx_;
+    int next_;
+    std::ofstream out_;
+};
+
+//std::unique_ptr<connection_pool> conn_pool;
+connection_pool* conn_pool;
 
 int main(int _argc, char* _argv[])
 {
@@ -42,23 +146,24 @@ int main(int _argc, char* _argv[])
 
     try
     {
-        const auto p = fs::canonical(_argv[1]);
+        const auto from = fs::canonical(_argv[1]);
         const ifs::path home = _argv[2];
 
         auto api_table = irods::get_client_api_table();
         auto pck_table = irods::get_pack_table();
         init_api_table(api_table, pck_table);
 
-        init_irods_environment();
+        auto cpool = std::make_unique<connection_pool>();
+        conn_pool = cpool.get();
 
-        if (fs::is_regular_file(p))
+        if (fs::is_regular_file(from))
         {
-            put_file(p, home / p.filename().string());
+            put_file(conn_pool->get_connection(), from, home / from.filename().string());
         }
-        else if (fs::is_directory(p))
+        else if (fs::is_directory(from))
         {
             boost::asio::thread_pool pool{std::thread::hardware_concurrency()};
-            put_directory(pool, p, home / std::rbegin(p)->string());
+            put_directory(pool, from, home / std::rbegin(from)->string());
             pool.join();
         }
         else
@@ -76,66 +181,9 @@ int main(int _argc, char* _argv[])
     return 0;
 }
 
-auto init_irods_environment() -> void
+constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int
 {
-    if (getRodsEnv(&env) < 0)
-        throw std::runtime_error{"cannot get iRODS env"};
-
-}
-
-auto connect_to_irods() -> std::unique_ptr<rcComm_t, void(*)(rcComm_t*)>
-{
-    static std::mutex m;
-
-    comm_ptr comm{nullptr, [](auto* p) { if (p) rcDisconnect(p); }};
-    rErrMsg_t errors;
-
-    {
-        std::lock_guard lock{m};
-        comm.reset(rcConnect(env.rodsHost, env.rodsPort, env.rodsUserName, env.rodsZone, 0, &errors));
-    }
-
-    if (!comm)
-        throw std::runtime_error{"connect error"};
-
-    char password[] = "rods";
-    if (clientLoginWithPassword(comm.get(), password) != 0)
-        throw std::runtime_error{"client login error"};
-
-    return comm;
-}
-
-auto put_file(const fs::path& _from, const ifs::path& _to) -> void
-{
-    try
-    {
-        std::ifstream in{_from.c_str(), std::ios_base::binary};
-
-        if (!in)
-            throw std::runtime_error{"cannot open file for reading"};
-
-        auto comm = connect_to_irods();
-
-        if (!comm)
-            throw std::runtime_error{"cannot open connection to iRODS server"};
-
-        irods::experimental::odstream out{*comm, _to};
-
-        if (!out)
-            throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
-
-        std::array<char, 4096> buf{};
-
-        while (in)
-        {
-            in.read(buf.data(), buf.size());
-            out.write(buf.data(), in.gcount());
-        }
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-    }
+    return _x * 1024 * 1024;
 }
 
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void
@@ -152,7 +200,7 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
         if (!out)
             throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
 
-        std::array<char, 4096> buf{};
+        std::array<char, 4_MB> buf{};
 
         while (in)
         {
@@ -168,70 +216,23 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
 
 auto put_directory(boost::asio::thread_pool& _pool, const fs::path& _from, const ifs::path& _to) -> void
 {
-    /*
-    for (auto&& e : fs::directory_iterator{_from})
-    {
-        if (fs::is_regular_file(e.status()))
-        {
-            boost::asio::post(_pool, [p = e.path(), _to]() {
-                put_file(p, _to / p.filename().string());
-            });
-        }
-        else if (fs::is_directory(e.status()))
-        {
-            const auto to = _to / std::rbegin(e.path())->string();
-            ifs::create_collections(*connect_to_irods(), to);
-
-            boost::asio::post(_pool, [&_pool, from = e.path(), to]() {
-                put_directory(_pool, from, to);
-            });
-        }
-    }
-    */
-
     for (auto&& e : fs::directory_iterator{_from})
     {
         boost::asio::post(_pool, [&_pool, s = e.status(), from = e.path(), _to]() {
             if (fs::is_regular_file(s))
             {
-                put_file(from, _to / from.filename().string());
+                auto conn = conn_pool->get_connection();
+                //ifs::create_collections(conn, _to);
+                put_file(conn, from, _to / from.filename().string());
             }
             else if (fs::is_directory(s))
             {
                 const auto to = _to / std::rbegin(from)->string();
-                ifs::create_collections(*connect_to_irods(), to);
+                auto conn = conn_pool->get_connection();
+                ifs::create_collections(conn, to);
                 put_directory(_pool, from, to);
             }
         });
     }
-
-    /*
-    for (auto&& e : fs::directory_iterator{_from})
-    {
-        boost::asio::post(_pool, [&_pool, s = e.status(), from = e.path(), _to]() {
-            /
-            if (auto comm = connect_to_irods(); comm)
-                ifs::exists(*comm, _to);
-
-            const auto to = _to / std::rbegin(from)->string() / from.filename().string();
-            if (auto comm = connect_to_irods(); comm)
-                ifs::exists(*comm, to);
-            /
-
-            if (fs::is_regular_file(s))
-            {
-                auto comm = connect_to_irods();
-                ifs::create_collections(*comm, _to);
-                put_file(*comm, from, _to / from.filename().string());
-            }
-            else if (fs::is_directory(s))
-            {
-                const auto to = _to / std::rbegin(from)->string();
-                ifs::create_collections(*connect_to_irods(), to);
-                put_directory(_pool, from, to);
-            }
-        });
-    }
-    */
 }
 
