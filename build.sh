@@ -11,5 +11,6 @@ clang++ -std=c++17 -stdlib=libc++ -nostdinc++ -Wall -Wextra -O3 \
         -lirods_common \
         -lirods_client \
         -lirods_plugin_dependencies \
+        -lboost_program_options \
         -lboost_filesystem \
         -lboost_system

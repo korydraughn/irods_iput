@@ -14,10 +14,12 @@
 #include <mutex>
 #include <atomic>
 
+#include <boost/program_options.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/thread_pool.hpp>
 
+namespace po   = boost::program_options;
 namespace fs   = boost::filesystem;
 namespace ifs  = irods::experimental::filesystem;
 namespace asio = boost::asio;
@@ -129,18 +131,31 @@ auto put_directory(connection_pool& _conn_pool,
 
 int main(int _argc, char* _argv[])
 {
-    if (_argc != 3)
+    po::options_description desc{"Allowed options"};
+    desc.add_options()
+        ("help,h", "produce help message")
+        ("src,s", po::value<std::string>()->required(), "local file/directory")
+        ("dst,d", po::value<std::string>()->required(), "iRODS collection")
+        ("connection_pool_size,c", po::value<int>()->default_value(4), "connection pool size for directories");
+
+    po::positional_options_description pod;
+    pod.add("src", 1);
+    pod.add("dst", 2);
+
+    po::variables_map vm;
+    po::store(po::command_line_parser{_argc, _argv}.options(desc).positional(pod).run(), vm);
+    po::notify(vm);
+
+    if (vm.count("help"))
     {
-        std::cerr << "USAGE:\n"
-                  << "\tmy_iput <file> <iRODS collection>\n"
-                  << "\tmy_iput <directory> <iRODS collection>\n";
+        std::cout << desc << '\n';
         return 0;
     }
 
     try
     {
-        const auto from = fs::canonical(_argv[1]);
-        const ifs::path to = _argv[2];
+        const auto from = fs::canonical(vm["s"].as<std::string>());
+        const ifs::path to = vm["d"].as<std::string>();
 
         auto api_table = irods::get_client_api_table();
         auto pck_table = irods::get_pack_table();
@@ -153,7 +168,7 @@ int main(int _argc, char* _argv[])
         }
         else if (fs::is_directory(from))
         {
-            connection_pool conn_pool{4};
+            connection_pool conn_pool{vm["c"].as<int>()};
             asio::thread_pool thread_pool{std::thread::hardware_concurrency()};
             put_directory(conn_pool, thread_pool, from, to / std::rbegin(from)->string());
             thread_pool.join();
