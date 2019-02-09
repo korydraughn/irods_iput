@@ -32,6 +32,9 @@ private:
     using connection_context_list = std::vector<connection_context>;
 
 public:
+    // A wrapper around a connection in the pool.
+    // On destruction, the underlying connection is immediately returned
+    // to the pool.
     class connection_proxy
     {
     public:
@@ -184,6 +187,22 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
 {
     try
     {
+#if defined(SINGLE_READ_WRITE) || defined(RETURN_FAST_ON_EMPTY_FILES)
+        const auto file_size = fs::file_size(_from);
+
+        // If the local file is empty, just create an empty data object
+        // on the iRODS server and return.
+        if (file_size == 0)
+        {
+            irods::experimental::odstream{_comm, _to};
+
+            if (!out)
+                throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+
+            return;
+        }
+#endif
+
         std::ifstream in{_from.c_str(), std::ios_base::binary};
 
         if (!in)
@@ -194,8 +213,11 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
         if (!out)
             throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
 
+#ifdef SINGLE_READ_WRITE
+        std::vector<char> buf(file_size);
+#else
         std::array<char, 4_MB> buf{};
-        //std::vector<char> buf(fs::file_size(_from)); // Not sure why this doesn't work.
+#endif
 
         while (in)
         {
