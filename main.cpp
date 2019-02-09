@@ -3,7 +3,6 @@
 #include <irods/dstream.hpp>
 #include <irods/irods_client_api_table.hpp>
 #include <irods/irods_pack_table.hpp>
-#include <irods/irods_at_scope_exit.hpp>
 
 #include <iostream>
 #include <memory>
@@ -92,10 +91,6 @@ public:
 
             if (lock.try_lock())
             {
-                irods::at_scope_exit<std::function<void()>> at_scope_exit{
-                    [&lock] { lock.unlock(); }
-                };
-
                 if (!conn_ctxs_[i].in_use.load())
                 {
                     conn_ctxs_[i].in_use.store(true);
