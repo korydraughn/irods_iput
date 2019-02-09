@@ -146,14 +146,14 @@ int main(int _argc, char* _argv[])
         auto pck_table = irods::get_pack_table();
         init_api_table(api_table, pck_table);
 
-        connection_pool conn_pool{4};
-
         if (fs::is_regular_file(from))
         {
+            connection_pool conn_pool{1};
             put_file(conn_pool.get_connection(), from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
         {
+            connection_pool conn_pool{4};
             asio::thread_pool thread_pool{std::thread::hardware_concurrency()};
             put_directory(conn_pool, thread_pool, from, to / std::rbegin(from)->string());
             thread_pool.join();
