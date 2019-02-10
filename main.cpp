@@ -66,17 +66,16 @@ public:
     };
 
     explicit connection_pool(const rodsEnv& _env, int _size = 4)
-        : env_{_env}
-        , conn_ctxs_(_size)
+        : conn_ctxs_(_size)
     {
         if (_size < 0)
             throw std::runtime_error{"invalid connection pool size"};
 
-        const auto connect = [this](auto& _conn, auto _on_connect_error, auto _on_login_error)
+        const auto connect = [&_env](auto& _conn, auto _on_connect_error, auto _on_login_error)
         {
             rErrMsg_t errors;
-            _conn.reset(rcConnect(env_.rodsHost, env_.rodsPort, env_.rodsUserName,
-                                  env_.rodsZone, 0, &errors));
+            _conn.reset(rcConnect(_env.rodsHost, _env.rodsPort, _env.rodsUserName,
+                                  _env.rodsZone, 0, &errors));
             if (!_conn)
             {
                 _on_connect_error();
@@ -153,7 +152,6 @@ private:
         conn_ctxs_[_index].in_use.store(false);
     }
 
-    const rodsEnv& env_;
     connection_context_list conn_ctxs_;
 };
 
