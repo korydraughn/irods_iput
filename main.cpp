@@ -64,13 +64,10 @@ public:
         int index_;
     };
 
-    explicit connection_pool(int _size = 4)
-        : env_{}
+    explicit connection_pool(const rodsEnv& _env, int _size = 4)
+        : env_{_env}
         , conn_ctxs_(_size)
     {
-        if (getRodsEnv(&env_) < 0)
-            throw std::runtime_error{"cannot get iRODS env"};
-
         for (auto&& ctx : conn_ctxs_)
         {
             rErrMsg_t errors;
@@ -116,7 +113,7 @@ private:
         conn_ctxs_[_index].in_use.store(false);
     }
 
-    rodsEnv env_;
+    const rodsEnv& env_;
     connection_context_list conn_ctxs_;
 };
 
@@ -131,11 +128,21 @@ auto put_directory(connection_pool& _conn_pool,
 
 int main(int _argc, char* _argv[])
 {
+    rodsEnv env;
+
+    if (getRodsEnv(&env) < 0)
+    {
+        std::cerr << "cannot get iRODS env\n";
+        return 1;
+    }
+
+    const std::string user_home = env.rodsHome;
+
     po::options_description desc{"Allowed options"};
     desc.add_options()
         ("help,h", "produce help message")
         ("src,s", po::value<std::string>()->required(), "local file/directory")
-        ("dst,d", po::value<std::string>()->required(), "iRODS collection")
+        ("dst,d", po::value<std::string>()->default_value(user_home), "iRODS collection [defaults to home collection]")
         ("connection_pool_size,c", po::value<int>()->default_value(4), "connection pool size for directories");
 
     po::positional_options_description pod;
@@ -154,8 +161,8 @@ int main(int _argc, char* _argv[])
 
     try
     {
-        const auto from = fs::canonical(vm["s"].as<std::string>());
-        const ifs::path to = vm["d"].as<std::string>();
+        const auto from = fs::canonical(vm["src"].as<std::string>());
+        const ifs::path to = vm["dst"].as<std::string>();
 
         auto api_table = irods::get_client_api_table();
         auto pck_table = irods::get_pack_table();
@@ -163,12 +170,12 @@ int main(int _argc, char* _argv[])
 
         if (fs::is_regular_file(from))
         {
-            connection_pool conn_pool{1};
+            connection_pool conn_pool{env, 1};
             put_file(conn_pool.get_connection(), from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
         {
-            connection_pool conn_pool{vm["c"].as<int>()};
+            connection_pool conn_pool{env, vm["connection_pool_size"].as<int>()};
             asio::thread_pool thread_pool{std::thread::hardware_concurrency()};
             put_directory(conn_pool, thread_pool, from, to / std::rbegin(from)->string());
             thread_pool.join();
