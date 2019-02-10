@@ -136,13 +136,11 @@ int main(int _argc, char* _argv[])
         return 1;
     }
 
-    const std::string user_home = env.rodsHome;
-
     po::options_description desc{"Allowed options"};
     desc.add_options()
         ("help,h", "produce help message")
         ("src,s", po::value<std::string>()->required(), "local file/directory")
-        ("dst,d", po::value<std::string>()->default_value(user_home), "iRODS collection [defaults to home collection]")
+        ("dst,d", po::value<std::string>()->default_value(env.rodsHome), "iRODS collection [defaults to home collection]")
         ("connection_pool_size,c", po::value<int>()->default_value(4), "connection pool size for directories");
 
     po::positional_options_description pod;
