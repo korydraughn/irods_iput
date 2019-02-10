@@ -104,7 +104,7 @@ public:
         for (auto&& ctx : conn_ctxs_)
         {
             asio::post(thread_pool, [&connect, &connect_error, &login_error, &ctx] {
-                if (connect_error || login_error)
+                if (connect_error.load() || login_error.load())
                     return;
 
                 connect(ctx.conn,
@@ -115,10 +115,10 @@ public:
 
         thread_pool.join();
 
-        if (connect_error)
+        if (connect_error.load())
             throw std::runtime_error{"connect error"};
 
-        if (login_error)
+        if (login_error.load())
             throw std::runtime_error{"client login error"};
     }
 
