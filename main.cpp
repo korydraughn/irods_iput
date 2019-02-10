@@ -13,6 +13,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 
 #include <boost/program_options.hpp>
 #include <boost/filesystem.hpp>
@@ -68,18 +69,58 @@ public:
         : env_{_env}
         , conn_ctxs_(_size)
     {
-        for (auto&& ctx : conn_ctxs_)
+        if (_size < 0)
+            throw std::runtime_error{"invalid connection pool size"};
+
+        const auto connect = [this](auto& _conn, auto _on_connect_error, auto _on_login_error)
         {
             rErrMsg_t errors;
-            ctx.conn.reset(rcConnect(env_.rodsHost, env_.rodsPort, env_.rodsUserName,
-                                     env_.rodsZone, 0, &errors));
-            if (!ctx.conn)
-                throw std::runtime_error{"connect error"};
+            _conn.reset(rcConnect(env_.rodsHost, env_.rodsPort, env_.rodsUserName,
+                                  env_.rodsZone, 0, &errors));
+            if (!_conn)
+            {
+                _on_connect_error();
+                return;
+            }
 
             char password[] = "rods";
-            if (clientLoginWithPassword(ctx.conn.get(), password) != 0)
-                throw std::runtime_error{"client login error"};
+
+            if (clientLoginWithPassword(_conn.get(), password) != 0)
+                _on_login_error();
+        };
+
+        if (_size == 1)
+        {
+            connect(conn_ctxs_[0].conn,
+                    [] { throw std::runtime_error{"connect error"}; },
+                    [] { throw std::runtime_error{"client login error"}; });
+            return;
         }
+
+        asio::thread_pool thread_pool{std::min<std::size_t>(_size, std::thread::hardware_concurrency())};
+
+        std::atomic connect_error = false;
+        std::atomic login_error = false;
+
+        for (auto&& ctx : conn_ctxs_)
+        {
+            asio::post(thread_pool, [&connect, &connect_error, &login_error, &ctx] {
+                if (connect_error || login_error)
+                    return;
+
+                connect(ctx.conn,
+                        [&connect_error] { connect_error.store(true); },
+                        [&login_error] { login_error.store(true); });
+            });
+        }
+
+        thread_pool.join();
+
+        if (connect_error)
+            throw std::runtime_error{"connect error"};
+
+        if (login_error)
+            throw std::runtime_error{"client login error"};
     }
 
     connection_proxy get_connection()
@@ -93,7 +134,6 @@ public:
                 if (!conn_ctxs_[i].in_use.load())
                 {
                     conn_ctxs_[i].in_use.store(true);
-
                     return {*this, *conn_ctxs_[i].conn, i};
                 }
             }
