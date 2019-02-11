@@ -18,12 +18,12 @@
 #include <boost/program_options.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/asio.hpp>
-#include <boost/asio/thread_pool.hpp>
 
 namespace po   = boost::program_options;
 namespace fs   = boost::filesystem;
-namespace ifs  = irods::experimental::filesystem;
 namespace asio = boost::asio;
+
+namespace ifs  = irods::experimental::filesystem;
 
 class connection_pool
 {
@@ -68,14 +68,33 @@ public:
     explicit connection_pool(const rodsEnv& _env, int _size = 4)
         : conn_ctxs_(_size)
     {
-        if (_size < 0)
+        if (_size < 1)
             throw std::runtime_error{"invalid connection pool size"};
 
+#if 0
+        rErrMsg_t errors;
+
+        for (auto&& ctx : conn_ctxs_)
+        {
+            ctx.conn.reset(rcConnect(_env.rodsHost, _env.rodsPort, _env.rodsUserName,
+                                     _env.rodsZone, 0, &errors));
+
+            if (!ctx.conn)
+                throw std::runtime_error{"connect error"};
+
+            char password[] = "rods";
+
+            if (clientLoginWithPassword(ctx.conn.get(), password) != 0)
+                throw std::runtime_error{"client login error"};
+        }
+#else
         const auto connect = [&_env](auto& _conn, auto _on_connect_error, auto _on_login_error)
         {
             rErrMsg_t errors;
+
             _conn.reset(rcConnect(_env.rodsHost, _env.rodsPort, _env.rodsUserName,
                                   _env.rodsZone, 0, &errors));
+
             if (!_conn)
             {
                 _on_connect_error();
@@ -88,21 +107,27 @@ public:
                 _on_login_error();
         };
 
+        // Always initialize the first connection to guarantee that the
+        // network plugin is loaded. This guarantees that no data races occur
+        // when the rest of the connections are initialized.
+        connect(conn_ctxs_[0].conn,
+                [] { throw std::runtime_error{"connect error"}; },
+                [] { throw std::runtime_error{"client login error"}; });
+
+        // If the size of the pool is one, then return immediately.
         if (_size == 1)
-        {
-            connect(conn_ctxs_[0].conn,
-                    [] { throw std::runtime_error{"connect error"}; },
-                    [] { throw std::runtime_error{"client login error"}; });
             return;
-        }
 
         asio::thread_pool thread_pool{std::min<std::size_t>(_size, std::thread::hardware_concurrency())};
 
         std::atomic connect_error = false;
         std::atomic login_error = false;
 
-        for (auto&& ctx : conn_ctxs_)
+        //for (auto&& ctx : conn_ctxs_)
+        for (int i = 1; i < _size; ++i)
         {
+            auto& ctx = conn_ctxs_[i];
+
             asio::post(thread_pool, [&connect, &connect_error, &login_error, &ctx] {
                 if (connect_error.load() || login_error.load())
                     return;
@@ -120,6 +145,7 @@ public:
 
         if (login_error.load())
             throw std::runtime_error{"client login error"};
+#endif
     }
 
     connection_proxy get_connection()
