@@ -1,6 +1,8 @@
 #include <irods/rodsClient.h>
 #include <irods/filesystem.hpp>
 #include <irods/dstream.hpp>
+#include <irods/connection_pool.hpp>
+#include <irods/thread_pool.hpp>
 #include <irods/irods_client_api_table.hpp>
 #include <irods/irods_pack_table.hpp>
 
@@ -19,163 +21,19 @@
 #include <boost/filesystem.hpp>
 #include <boost/asio.hpp>
 
-#include "irods_thread_pool.hpp"
-
 namespace po   = boost::program_options;
 namespace fs   = boost::filesystem;
 namespace asio = boost::asio;
 
 namespace ifs  = irods::experimental::filesystem;
 
-class connection_pool
-{
-private:
-    struct connection_context;
-
-    using connection_pointer      = std::unique_ptr<rcComm_t, int(*)(rcComm_t*)>;
-    using connection_context_list = std::vector<connection_context>;
-
-public:
-    // A wrapper around a connection in the pool.
-    // On destruction, the underlying connection is immediately returned
-    // to the pool.
-    class connection_proxy
-    {
-    public:
-        friend class connection_pool;
-
-        ~connection_proxy()
-        {
-            pool_.return_connection(index_);
-        }
-
-        operator rcComm_t&() const noexcept
-        {
-            return conn_;
-        }
-
-    private:
-        connection_proxy(connection_pool& _pool, rcComm_t& _conn, int _index) noexcept
-            : pool_{_pool}
-            , conn_{_conn}
-            , index_{_index}
-        {
-        }
-
-        connection_pool& pool_;
-        rcComm_t& conn_;
-        int index_;
-    };
-
-    explicit connection_pool(const rodsEnv& _env, int _size = 4)
-        : conn_ctxs_(_size)
-    {
-        if (_size < 1)
-            throw std::runtime_error{"invalid connection pool size"};
-
-        const auto connect = [&_env](auto& _conn, auto _on_connect_error, auto _on_login_error)
-        {
-            rErrMsg_t errors;
-
-            _conn.reset(rcConnect(_env.rodsHost, _env.rodsPort, _env.rodsUserName,
-                                  _env.rodsZone, 0, &errors));
-
-            if (!_conn)
-            {
-                _on_connect_error();
-                return;
-            }
-
-            char password[] = "rods";
-
-            if (clientLoginWithPassword(_conn.get(), password) != 0)
-                _on_login_error();
-        };
-
-        // Always initialize the first connection to guarantee that the
-        // network plugin is loaded. This guarantees that asynchronous calls
-        // to rcConnect do not cause a segfault.
-        connect(conn_ctxs_[0].conn,
-                [] { throw std::runtime_error{"connect error"}; },
-                [] { throw std::runtime_error{"client login error"}; });
-
-        // If the size of the pool is one, then return immediately.
-        if (_size == 1)
-            return;
-
-        // Initialize the rest of the connection pool asynchronously.
-
-        //asio::thread_pool thread_pool{std::min<std::size_t>(_size, std::thread::hardware_concurrency())};
-        irods::thread_pool thread_pool{std::min<int>(_size, std::thread::hardware_concurrency())};
-
-        std::atomic connect_error = false;
-        std::atomic login_error = false;
-
-        for (int i = 1; i < _size; ++i)
-        {
-            auto& ctx = conn_ctxs_[i];
-
-            //asio::post(thread_pool, [&connect, &connect_error, &login_error, &ctx] {
-            irods::post(thread_pool, [&connect, &connect_error, &login_error, &ctx] {
-                if (connect_error.load() || login_error.load())
-                    return;
-
-                connect(ctx.conn,
-                        [&connect_error] { connect_error.store(true); },
-                        [&login_error] { login_error.store(true); });
-            });
-        }
-
-        thread_pool.join();
-
-        if (connect_error.load())
-            throw std::runtime_error{"connect error"};
-
-        if (login_error.load())
-            throw std::runtime_error{"client login error"};
-    }
-
-    connection_proxy get_connection()
-    {
-        for (int i = 0;; i = ++i % conn_ctxs_.size())
-        {
-            std::unique_lock lock{conn_ctxs_[i].mutex, std::defer_lock};
-
-            if (lock.try_lock())
-            {
-                if (!conn_ctxs_[i].in_use.load())
-                {
-                    conn_ctxs_[i].in_use.store(true);
-                    return {*this, *conn_ctxs_[i].conn, i};
-                }
-            }
-        }
-    }
-
-private:
-    struct connection_context
-    {
-        std::mutex mutex;
-        std::atomic<bool> in_use{};
-        connection_pointer conn{nullptr, rcDisconnect};
-    };
-
-    void return_connection(int _index) noexcept
-    {
-        conn_ctxs_[_index].in_use.store(false);
-    }
-
-    connection_context_list conn_ctxs_;
-};
-
 constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
 
 auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
 
-auto put_directory(connection_pool& _conn_pool,
+auto put_directory(irods::connection_pool& _conn_pool,
                    irods::thread_pool& _pool,
-                   //asio::thread_pool& _pool,
                    const fs::path& _from,
                    const ifs::path& _to) -> void;
 
@@ -221,14 +79,14 @@ int main(int _argc, char* _argv[])
 
         if (fs::is_regular_file(from))
         {
-            //connection_pool conn_pool{env, 1};
+            //irods::connection_pool conn_pool{1, env.rodsHost, env.rodsPort, env.rodsUserName, env.rodsZone};
             //put_file(conn_pool.get_connection(), from, to / from.filename().string());
             put_file(env, from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
         {
-            connection_pool conn_pool{env, vm["connection_pool_size"].as<int>()};
-            //asio::thread_pool thread_pool{std::thread::hardware_concurrency()};
+            const auto pool_size = vm["connection_pool_size"].as<int>();
+            irods::connection_pool conn_pool{pool_size, env.rodsHost, env.rodsPort, env.rodsUserName, env.rodsZone};
             irods::thread_pool thread_pool{static_cast<int>(std::thread::hardware_concurrency())};
             put_directory(conn_pool, thread_pool, from, to / std::rbegin(from)->string());
             thread_pool.join();
@@ -263,7 +121,7 @@ auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) 
         // on the iRODS server and return.
         if (file_size == 0)
         {
-            connection_pool cpool{_env, 1};
+            irods::connection_pool cpool{1, _env.rodsHost, _env.rodsPort, _env.rodsUserName, _env.rodsZone};
             irods::experimental::odstream out{cpool.get_connection(), _to};
 
             if (!out)
@@ -275,7 +133,7 @@ auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) 
         using count_t = unsigned long;
 
         constexpr count_t count = 3;//std::thread::hardware_concurrency();
-        connection_pool cpool(_env, count);
+        irods::connection_pool cpool(count, _env.rodsHost, _env.rodsPort, _env.rodsUserName, _env.rodsZone);
         irods::thread_pool tpool(count);
 
         const count_t chunk_size = file_size / count;
@@ -409,9 +267,8 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
     }
 }
 
-auto put_directory(connection_pool& _conn_pool,
+auto put_directory(irods::connection_pool& _conn_pool,
                    irods::thread_pool& _thread_pool,
-                   //asio::thread_pool& _thread_pool,
                    const fs::path& _from,
                    const ifs::path& _to) -> void
 {
