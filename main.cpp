@@ -29,6 +29,11 @@ namespace ifs  = irods::experimental::filesystem;
 
 constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int;
 
+auto put_file_chunk(irods::connection_pool& _conn_pool,
+                    const fs::path& _from,
+                    const ifs::path& _to,
+                    unsigned long _offset,
+                    unsigned long _chunk_size) -> void;
 auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) -> void;
 auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> void;
 
@@ -79,8 +84,6 @@ int main(int _argc, char* _argv[])
 
         if (fs::is_regular_file(from))
         {
-            //irods::connection_pool conn_pool{1, env.rodsHost, env.rodsPort, env.rodsUserName, env.rodsZone};
-            //put_file(conn_pool.get_connection(), from, to / from.filename().string());
             put_file(env, from, to / from.filename().string());
         }
         else if (fs::is_directory(from))
@@ -111,6 +114,44 @@ constexpr auto operator ""_MB(unsigned long long _x) noexcept -> int
     return _x * 1024 * 1024;
 }
 
+auto put_file_chunk(irods::connection_pool& _cpool,
+                    const fs::path& _from,
+                    const ifs::path& _to,
+                    unsigned long _offset,
+                    unsigned long _chunk_size) -> void
+{
+    try
+    {
+        std::ifstream in{_from.c_str(), std::ios_base::binary};
+
+        if (!in)
+            throw std::runtime_error{"cannot open file for reading"};
+
+        auto conn = _cpool.get_connection();
+        irods::experimental::odstream out{conn, _to};
+
+        if (!out)
+            throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+
+        in.seekg(_offset);
+        out.seekp(_offset);
+
+        std::array<char, 4_MB> buf{};
+        unsigned long bytes_pushed = 0;
+
+        while (in && bytes_pushed < _chunk_size)
+        {
+            in.read(buf.data(), std::min(buf.size(), _chunk_size));
+            out.write(buf.data(), in.gcount());
+            bytes_pushed += in.gcount();
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << e.what() << '\n';
+    }
+}
+
 auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) -> void
 {
     try
@@ -130,84 +171,28 @@ auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) 
             return;
         }
 
-        using count_t = unsigned long;
+        using int_type = unsigned long;
 
-        constexpr count_t count = 3;//std::thread::hardware_concurrency();
-        irods::connection_pool cpool(count, _env.rodsHost, _env.rodsPort, _env.rodsUserName, _env.rodsZone);
-        irods::thread_pool tpool(count);
+        constexpr int_type thread_count = 3;
+        irods::connection_pool cpool{thread_count, _env.rodsHost, _env.rodsPort, _env.rodsUserName, _env.rodsZone};
+        irods::thread_pool tpool{static_cast<int>(thread_count)};
 
-        const count_t chunk_size = file_size / count;
-        const count_t remainder = file_size % count;
+        const int_type chunk_size = file_size / thread_count;
+        const int_type remainder = file_size % thread_count;
 
         { irods::experimental::odstream target{cpool.get_connection(), _to}; }
 
-        for (count_t i = 0; i < count; ++i)
+        for (int_type i = 0; i < thread_count; ++i)
         {
-            irods::post(tpool, [&, i] {
-                try
-                {
-                    std::ifstream in{_from.c_str(), std::ios_base::binary};
-
-                    if (!in)
-                        throw std::runtime_error{"cannot open file for reading"};
-
-                    auto conn = cpool.get_connection();
-                    irods::experimental::odstream out{conn, _to};
-
-                    if (!out)
-                        throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
-
-                    in.seekg(i * chunk_size);
-                    out.seekp(i * chunk_size);
-
-                    std::array<char, 4_MB> buf{};
-                    count_t bytes_pushed = 0;
-
-                    while (in && bytes_pushed < chunk_size)
-                    {
-                        in.read(buf.data(), std::min(buf.size(), chunk_size));
-                        out.write(buf.data(), in.gcount());
-                        bytes_pushed += in.gcount();
-                    }
-                }
-                catch (const std::exception& e)
-                {
-                    std::cerr << e.what() << '\n';
-                }
+            irods::thread_pool::post(tpool, [&, offset = i * chunk_size] {
+                put_file_chunk(cpool, _from, _to, offset, chunk_size);
             });
         }
 
         if (remainder > 0)
         {
-            irods::post(tpool, [&] {
-                try
-                {
-                    std::ifstream in{_from.c_str(), std::ios_base::binary};
-
-                    if (!in)
-                        throw std::runtime_error{"cannot open file for reading"};
-
-                    auto conn = cpool.get_connection();
-                    irods::experimental::odstream out{conn, _to};
-
-                    if (!out)
-                        throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
-
-                    in.seekg(count * chunk_size);
-                    out.seekp(count * chunk_size);
-
-                    std::array<char, 4_MB> buf{};
-
-                    while (in)
-                    {
-                        in.read(buf.data(), std::min(buf.size(), chunk_size));
-                        out.write(buf.data(), in.gcount());
-                    }
-                }
-                catch (const std::exception& e)
-                {
-                    std::cerr << e.what() << '\n';
-                }
+            irods::thread_pool::post(tpool, [&, offset = thread_count * chunk_size] {
+                put_file_chunk(cpool, _from, _to, offset, remainder);
             });
         }
 
@@ -223,7 +208,6 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
 {
     try
     {
-#if defined(SINGLE_READ_WRITE) || defined(RETURN_FAST_ON_EMPTY_FILES)
         const auto file_size = fs::file_size(_from);
 
         // If the local file is empty, just create an empty data object
@@ -237,7 +221,6 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
 
             return;
         }
-#endif
 
         std::ifstream in{_from.c_str(), std::ios_base::binary};
 
@@ -249,11 +232,7 @@ auto put_file(rcComm_t& _comm, const fs::path& _from, const ifs::path& _to) -> v
         if (!out)
             throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
 
-#ifdef SINGLE_READ_WRITE
-        std::vector<char> buf(file_size);
-#else
         std::array<char, 4_MB> buf{};
-#endif
 
         while (in)
         {
@@ -276,8 +255,7 @@ auto put_directory(irods::connection_pool& _conn_pool,
 
     for (auto&& e : fs::directory_iterator{_from})
     {
-        //asio::post(_thread_pool, [&_conn_pool, &_thread_pool, e, _to]() {
-        irods::post(_thread_pool, [&_conn_pool, &_thread_pool, e, _to]() {
+        irods::thread_pool::post(_thread_pool, [&_conn_pool, &_thread_pool, e, _to]() {
             const auto& from = e.path();
 
             if (fs::is_regular_file(e.status()))
