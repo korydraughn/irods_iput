@@ -158,15 +158,25 @@ auto put_file(const rodsEnv& _env, const fs::path& _from, const ifs::path& _to) 
     {
         const auto file_size = fs::file_size(_from);
 
-        // If the local file is empty, just create an empty data object
-        // on the iRODS server and return.
-        if (file_size == 0)
+        // If the local file's size is less than 32MB, then stream the file
+        // over a single connection.
+        if (file_size < 32_MB)
         {
             irods::connection_pool cpool{1, _env.rodsHost, _env.rodsPort, _env.rodsUserName, _env.rodsZone};
-            irods::experimental::odstream out{cpool.get_connection(), _to};
 
-            if (!out)
-                throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+            // If the local file is empty, just create an empty data object
+            // on the iRODS server and return.
+            if (file_size == 0)
+            {
+                irods::experimental::odstream out{cpool.get_connection(), _to};
+
+                if (!out)
+                    throw std::runtime_error{"cannot open data object for writing [path: " + _to.string() + ']'};
+
+                return;
+            }
+
+            put_file(cpool.get_connection(), _from, _to);
 
             return;
         }
